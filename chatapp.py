@@ -1,4 +1,3 @@
-
 import os
 from dataclasses import dataclass
 from typing import Iterable
@@ -32,10 +31,34 @@ class DocumentChunk:
     page: int
 
 
+def get_api_key() -> str | None:
+    """Retrieve API key from Streamlit secrets, environment variables, or session state."""
+    # 1. Check Streamlit Cloud secrets
+    try:
+        if "GOOGLE_API_KEY" in st.secrets and st.secrets["GOOGLE_API_KEY"]:
+            return str(st.secrets["GOOGLE_API_KEY"]).strip()
+    except Exception:
+        pass
+
+    # 2. Check environment variable
+    env_key = os.getenv("GOOGLE_API_KEY")
+    if env_key and env_key.strip():
+        return env_key.strip()
+
+    # 3. Check user input in session state
+    user_key = st.session_state.get("user_api_key")
+    if user_key and str(user_key).strip():
+        return str(user_key).strip()
+
+    return None
+
+
 def get_client() -> genai.Client:
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = get_api_key()
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is missing. Add it to the .env file and restart Streamlit.")
+        raise RuntimeError(
+            "GOOGLE_API_KEY is missing. Please enter your API key in the sidebar or add it to your .env file."
+        )
     return genai.Client(api_key=api_key)
 
 
@@ -111,6 +134,9 @@ def embed_chunks(client: genai.Client, chunks: list[DocumentChunk]) -> np.ndarra
 
 
 def retrieve_context(client: genai.Client, question: str, limit: int = 6) -> list[tuple[DocumentChunk, float]]:
+    if st.session_state.document_embeddings is None or len(st.session_state.document_chunks) == 0:
+        return []
+
     question_response = client.models.embed_content(
         model=EMBEDDING_MODEL,
         contents=question,
@@ -119,12 +145,22 @@ def retrieve_context(client: genai.Client, question: str, limit: int = 6) -> lis
     query = np.asarray(question_response.embeddings[0].values, dtype=np.float32)
     query /= max(float(np.linalg.norm(query)), 1e-12)
     scores = st.session_state.document_embeddings @ query
-    best_indices = np.argsort(scores)[-limit:][::-1]
+
+    actual_limit = min(limit, len(st.session_state.document_chunks))
+    if actual_limit <= 0:
+        return []
+
+    best_indices = np.argsort(scores)[-actual_limit:][::-1]
     return [(st.session_state.document_chunks[index], float(scores[index])) for index in best_indices]
 
 
-def answer_question(client: genai.Client, question: str) -> tuple[str, list[tuple[DocumentChunk, float]]]:
-    matches = retrieve_context(client, question)
+def answer_question(
+    client: genai.Client, question: str, limit: int = 6
+) -> tuple[str, list[tuple[DocumentChunk, float]]]:
+    matches = retrieve_context(client, question, limit=limit)
+    if not matches:
+        return "I couldn't find any relevant passages in the processed documents.", []
+
     context = "\n\n".join(
         f"[Source: {chunk.source}, page {chunk.page}]\n{chunk.text}"
         for chunk, _ in matches
@@ -146,8 +182,31 @@ QUESTION: {question}
     return response.text or "I couldn't generate an answer. Please try again.", matches
 
 
+def generate_chat_export() -> str:
+    """Format conversation history into Markdown for export."""
+    lines = ["# PDF Compass — Chat Export", ""]
+    for msg in st.session_state.messages:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        lines.append(f"### {role}")
+        lines.append(msg["content"])
+        if msg.get("sources"):
+            lines.append("")
+            lines.append("**Sources used:**")
+            for source in msg["sources"]:
+                lines.append(f"- {source}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def initialise_state() -> None:
-    defaults = {"messages": [], "document_chunks": [], "document_embeddings": None, "document_names": []}
+    defaults = {
+        "messages": [],
+        "document_chunks": [],
+        "document_embeddings": None,
+        "document_names": [],
+        "user_api_key": "",
+        "top_k": 6,
+    }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -156,26 +215,79 @@ def initialise_state() -> None:
 def main() -> None:
     st.set_page_config(page_title="PDF Compass", page_icon="📚", layout="wide")
     initialise_state()
-    st.markdown("""
+
+    st.markdown(
+        """
     <style>
       .block-container { max-width: 1000px; padding-top: 2.25rem; }
       [data-testid="stSidebar"] { background: #101828; }
       [data-testid="stSidebar"] * { color: #f8fafc; }
       .hero { margin-bottom: 1.5rem; }
       .hero h1 { margin-bottom: .2rem; }
+      .stDownloadButton button { width: 100%; }
     </style>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
+
+    api_key_configured = get_api_key() is not None
 
     with st.sidebar:
         st.title("📚 PDF Compass")
         st.caption("Grounded answers from your documents")
-        uploaded_files = st.file_uploader("Add PDF documents", type=["pdf"], accept_multiple_files=True)
-        process = st.button("Process documents", type="primary", use_container_width=True, disabled=not uploaded_files)
+
+        # API Key management section
+        if not api_key_configured:
+            st.warning("🔑 Google API Key needed")
+            user_key_input = st.text_input(
+                "Enter Google API Key",
+                type="password",
+                placeholder="AIzaSy...",
+                help="Get your key at https://aistudio.google.com/",
+            )
+            if user_key_input:
+                st.session_state.user_api_key = user_key_input.strip()
+                st.rerun()
+        else:
+            st.caption("🟢 Google API Key configured")
+
+        uploaded_files = st.file_uploader(
+            "Add PDF documents", type=["pdf"], accept_multiple_files=True
+        )
+        process = st.button(
+            "Process documents",
+            type="primary",
+            use_container_width=True,
+            disabled=not uploaded_files or not get_api_key(),
+        )
+
+        with st.expander("⚙️ RAG Settings"):
+            st.session_state.top_k = st.slider(
+                "Passages to retrieve per query",
+                min_value=1,
+                max_value=15,
+                value=st.session_state.top_k,
+                help="Number of document passages sent to Gemini for context.",
+            )
+
         if st.session_state.document_chunks:
             st.divider()
-            st.caption(f"Ready: {len(st.session_state.document_chunks)} passages from {len(st.session_state.document_names)} files")
+            st.caption(
+                f"Ready: {len(st.session_state.document_chunks)} passages from {len(st.session_state.document_names)} files"
+            )
             for name in st.session_state.document_names:
                 st.caption(f"• {name}")
+
+            st.write("")
+            if st.session_state.messages:
+                st.download_button(
+                    label="📥 Export Chat (.md)",
+                    data=generate_chat_export(),
+                    file_name="pdf_compass_chat.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+
             if st.button("Clear chat and documents", use_container_width=True):
                 st.session_state.messages = []
                 st.session_state.document_chunks = []
@@ -201,10 +313,17 @@ def main() -> None:
         except Exception as error:
             st.error(f"Could not process the documents: {error}")
 
-    st.markdown("<div class='hero'><h1>Ask your PDFs anything</h1><p>Upload documents, process them, then ask a question. Every answer is grounded in the uploaded text.</p></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='hero'><h1>Ask your PDFs anything</h1><p>Upload documents, process them, then ask a question. Every answer is grounded in the uploaded text.</p></div>",
+        unsafe_allow_html=True,
+    )
+
+    if not get_api_key():
+        st.info("👈 Please enter your Google API Key in the sidebar to get started.")
+        return
 
     if not st.session_state.document_chunks:
-        st.info("Start by adding one or more PDF files in the sidebar.")
+        st.info("Start by adding one or more PDF files in the sidebar and clicking 'Process documents'.")
         return
 
     for message in st.session_state.messages:
@@ -222,13 +341,21 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.spinner("Searching your documents…"):
                 try:
-                    response, matches = answer_question(get_client(), question)
+                    client = get_client()
+                    response, matches = answer_question(
+                        client, question, limit=st.session_state.top_k
+                    )
                     st.markdown(response)
-                    sources = list(dict.fromkeys(f"{chunk.source} — page {chunk.page}" for chunk, _ in matches))
-                    with st.expander("Sources used"):
-                        for source in sources:
-                            st.caption(source)
-                    st.session_state.messages.append({"role": "assistant", "content": response, "sources": sources})
+                    sources = list(
+                        dict.fromkeys(f"{chunk.source} — page {chunk.page}" for chunk, _ in matches)
+                    )
+                    if sources:
+                        with st.expander("Sources used"):
+                            for source in sources:
+                                st.caption(source)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": response, "sources": sources}
+                    )
                 except Exception as error:
                     message = f"I couldn't answer that because of an API or document-search error: {error}"
                     st.error(message)

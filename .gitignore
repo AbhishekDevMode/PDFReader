@@ -396,3 +396,20 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Python environment and secrets
+.env
+.env.local
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.streamlit/secrets.toml
+.DS_Store
+
